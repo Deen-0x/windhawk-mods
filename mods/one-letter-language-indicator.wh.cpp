@@ -46,6 +46,17 @@ text is restored when the mod is disabled.
   indicator is narrowed to 32 pixels, the width of a regular tray icon. Set it
   to 0 to keep the Windows width.
 
+## Notes
+
+- Languages and layouts which start with the same letter look the same, e.g.
+  `ENG (US)` and `ENG (UK)`, or `ENG` and `ESP`.
+- Other mods may set the same properties. "Taskbar tray icon spacing and grid"
+  sets the width of the language indicator: while **Indicator width** is set,
+  this mod's width wins. Windows 11 Taskbar Styler themes which change the font
+  size or color of the indicator conflict with **Letter size** and **Letter
+  color**, and whichever mod applies last wins. To let the other mod control a
+  property, set the matching setting to 0 (or leave the color empty).
+
 ## Target
 
 ```
@@ -131,17 +142,26 @@ struct {
 std::atomic<bool> g_systemTrayModuleHooked;
 std::atomic<bool> g_unloading;
 
-using FrameworkElementLoadedEventRevoker = winrt::impl::event_revoker<
-    IFrameworkElement,
-    &winrt::impl::abi<IFrameworkElement>::type::remove_Loaded>;
+// Globals which own XAML/WinRT objects are marked no_destroy and released on the
+// taskbar thread in ApplySettings when the mod unloads. When explorer exits,
+// Wh_ModUninit doesn't run, and the automatic destructors would release the
+// objects from the exiting thread, after XAML may already be torn down. If the
+// taskbar thread can't be reached on unload, the objects are kept alive, which
+// is safer than releasing them from the wrong thread.
 
 // Loaded handlers of tray icons which haven't been loaded yet.
-std::list<FrameworkElementLoadedEventRevoker> g_autoRevokerList;
+[[clang::no_destroy]] std::optional<std::list<FrameworkElement::Loaded_revoker>>
+    g_autoRevokerList{std::in_place};
 
 // Only used when a color setting refers to the accent color. Created and
 // released on the taskbar UI thread.
-UISettings g_uiSettings{nullptr};
+[[clang::no_destroy]] UISettings g_uiSettings{nullptr};
 winrt::event_token g_colorValuesChangedToken{};
+
+// ColorValuesChanged handlers currently running on worker threads. Wh_ModUninit
+// waits for them, since they run mod code and install a hook on the taskbar
+// thread.
+std::atomic<int> g_colorValuesChangedHandlersRunning;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers.
@@ -312,8 +332,9 @@ struct PropertyOverride {
     winrt::event_token themeChangedToken{};
 };
 
-// Only accessed from the taskbar UI thread.
-std::list<PropertyOverride> g_propertyOverrides;
+// Only accessed from the taskbar UI thread. See the note on no_destroy above.
+[[clang::no_destroy]] std::optional<std::list<PropertyOverride>>
+    g_propertyOverrides{std::in_place};
 
 void RestoreOriginalValue(PropertyOverride& propertyOverride,
                           const DependencyObject& element) {
@@ -368,7 +389,11 @@ void ApplyPropertyOverride(PropertyOverride& propertyOverride,
 }
 
 void RefreshAllPropertyOverrides() {
-    for (auto& propertyOverride : g_propertyOverrides) {
+    if (!g_propertyOverrides) {
+        return;
+    }
+
+    for (auto& propertyOverride : *g_propertyOverrides) {
         auto element = propertyOverride.element.get();
         if (!element) {
             continue;
@@ -386,18 +411,23 @@ void TrackProperty(const DependencyObject& element,
                    const DependencyProperty& property,
                    ComputeOverride_t computeOverride,
                    bool refreshOnThemeChange = false) {
+    if (!g_propertyOverrides) {
+        return;
+    }
+
+    auto& propertyOverrides = *g_propertyOverrides;
+
     // Drop entries of elements which no longer exist.
-    for (auto it = g_propertyOverrides.begin();
-         it != g_propertyOverrides.end();) {
+    for (auto it = propertyOverrides.begin(); it != propertyOverrides.end();) {
         if (!it->element.get()) {
-            it = g_propertyOverrides.erase(it);
+            it = propertyOverrides.erase(it);
         } else {
             ++it;
         }
     }
 
     // Already tracked, e.g. the Loaded event fired more than once.
-    for (auto& propertyOverride : g_propertyOverrides) {
+    for (auto& propertyOverride : propertyOverrides) {
         if (propertyOverride.property == property &&
             propertyOverride.element.get() == element) {
             ApplyPropertyOverride(propertyOverride, element);
@@ -405,8 +435,8 @@ void TrackProperty(const DependencyObject& element,
         }
     }
 
-    g_propertyOverrides.emplace_back();
-    auto it = std::prev(g_propertyOverrides.end());
+    propertyOverrides.emplace_back();
+    auto it = std::prev(propertyOverrides.end());
 
     it->element = winrt::make_weak(element);
     it->property = property;
@@ -450,7 +480,11 @@ void TrackProperty(const DependencyObject& element,
 }
 
 void RestoreAllPropertyOverrides() {
-    for (auto& propertyOverride : g_propertyOverrides) {
+    if (!g_propertyOverrides) {
+        return;
+    }
+
+    for (auto& propertyOverride : *g_propertyOverrides) {
         auto element = propertyOverride.element.get();
         if (!element) {
             continue;
@@ -473,7 +507,7 @@ void RestoreAllPropertyOverrides() {
         }
     }
 
-    g_propertyOverrides.clear();
+    g_propertyOverrides->clear();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -548,9 +582,9 @@ std::optional<Color> ResolveColorSetting(const std::wstring& setting) {
 }
 
 // Must be called on the taskbar UI thread. The ColorValuesChanged event fires
-// on a background thread, so the refresh is sent back to the taskbar thread.
+// on a worker thread, so the refresh is sent back to the taskbar thread.
 void RegisterAccentColorChanges() {
-    if (g_uiSettings) {
+    if (g_uiSettings || g_unloading) {
         return;
     }
 
@@ -558,6 +592,15 @@ void RegisterAccentColorChanges() {
         g_uiSettings = UISettings();
         g_colorValuesChangedToken = g_uiSettings.ColorValuesChanged(
             [](const UISettings&, const WinrtInspectable&) {
+                // Counted before checking g_unloading, so that Wh_ModUninit
+                // either sees this handler or the handler sees g_unloading.
+                g_colorValuesChangedHandlersRunning++;
+                struct RunningHandlerGuard {
+                    ~RunningHandlerGuard() {
+                        g_colorValuesChangedHandlersRunning--;
+                    }
+                } runningHandlerGuard;
+
                 if (g_unloading) {
                     return;
                 }
@@ -770,7 +813,7 @@ IconView_IconView_t IconView_IconView_Original;
 void* WINAPI IconView_IconView_Hook(void* pThis) {
     void* ret = IconView_IconView_Original(pThis);
 
-    if (g_unloading) {
+    if (g_unloading || !g_autoRevokerList) {
         return ret;
     }
 
@@ -783,14 +826,15 @@ void* WINAPI IconView_IconView_Hook(void* pThis) {
 
     // The icon's content isn't created yet, look for the language indicator
     // once the icon is loaded.
-    g_autoRevokerList.emplace_back();
-    auto autoRevokerIt = g_autoRevokerList.end();
-    --autoRevokerIt;
+    g_autoRevokerList->emplace_back();
+    auto autoRevokerIt = std::prev(g_autoRevokerList->end());
 
     *autoRevokerIt = iconView.Loaded(
-        winrt::auto_revoke_t{},
+        winrt::auto_revoke,
         [autoRevokerIt](const WinrtInspectable& sender, const RoutedEventArgs&) {
-            g_autoRevokerList.erase(autoRevokerIt);
+            // The list is reset only on unload, which also revokes this
+            // handler, so it's still there when the handler runs.
+            g_autoRevokerList->erase(autoRevokerIt);
 
             if (g_unloading) {
                 return;
@@ -904,9 +948,7 @@ XamlRoot GetTaskbarXamlRoot(HWND hTaskbarWnd) {
 // Settings.
 
 std::wstring GetTrimmedStringSetting(PCWSTR name) {
-    PCWSTR value = Wh_GetStringSetting(name);
-    std::wstring result = value;
-    Wh_FreeStringSetting(value);
+    std::wstring result = WindhawkUtils::StringSetting::make(name).get();
 
     size_t first = result.find_first_not_of(L" \t");
     if (first == std::wstring::npos) {
@@ -917,6 +959,9 @@ std::wstring GetTrimmedStringSetting(PCWSTR name) {
     return result.substr(first, last - first + 1);
 }
 
+// Once the mod is running, the settings are read on the taskbar thread (by
+// property callbacks and Loaded handlers), so they're reloaded there too. See
+// ApplySettings.
 void LoadSettings() {
     g_settings.fontSize = Wh_GetIntSetting(L"fontSize");
     if (g_settings.fontSize < 0) {
@@ -934,28 +979,49 @@ void LoadSettings() {
     }
 }
 
-// Restores everything, then, unless unloading, applies the current settings to
-// the existing taskbar.
-void ApplySettings() {
+// On the taskbar thread: restores everything, optionally reloads the settings,
+// then, unless unloading, applies the settings to the existing taskbar. When
+// unloading, releases the XAML-owning globals on the taskbar thread.
+void ApplySettings(bool reloadSettings) {
     Wh_Log(L"Applying settings");
 
     HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
     if (!hTaskbarWnd) {
         Wh_Log(L"No taskbar found");
+        // Nothing reads the settings on the taskbar thread without a taskbar.
+        if (reloadSettings) {
+            LoadSettings();
+        }
         return;
     }
 
-    RunFromWindowThread(
+    struct ApplySettingsParam {
+        HWND hTaskbarWnd;
+        bool reloadSettings;
+    };
+
+    ApplySettingsParam param{
+        .hTaskbarWnd = hTaskbarWnd,
+        .reloadSettings = reloadSettings,
+    };
+
+    bool ran = RunFromWindowThread(
         hTaskbarWnd,
         [](void* pParam) {
-            HWND hTaskbarWnd = (HWND)pParam;
+            const auto& param = *(const ApplySettingsParam*)pParam;
+            HWND hTaskbarWnd = param.hTaskbarWnd;
 
             RestoreAllPropertyOverrides();
 
             if (g_unloading) {
                 UnregisterAccentColorChanges();
-                g_autoRevokerList.clear();
+                g_autoRevokerList.reset();
+                g_propertyOverrides.reset();
                 return;
+            }
+
+            if (param.reloadSettings) {
+                LoadSettings();
             }
 
             if (UsesAccentColor()) {
@@ -990,7 +1056,14 @@ void ApplySettings() {
                 Wh_Log(L"Error %08X: %s", ex.code(), ex.message().c_str());
             }
         },
-        hTaskbarWnd);
+        &param);
+
+    if (!ran) {
+        Wh_Log(L"Failed to run on the taskbar thread");
+        if (reloadSettings) {
+            LoadSettings();
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1168,7 +1241,8 @@ void Wh_ModAfterInit() {
         }
     }
 
-    ApplySettings();
+    // The settings were loaded in Wh_ModInit.
+    ApplySettings(/*reloadSettings=*/false);
 }
 
 void Wh_ModBeforeUninit() {
@@ -1176,17 +1250,22 @@ void Wh_ModBeforeUninit() {
 
     g_unloading = true;
 
-    ApplySettings();
+    ApplySettings(/*reloadSettings=*/false);
 }
 
 void Wh_ModUninit() {
     Wh_Log(L">");
+
+    // A ColorValuesChanged handler which started before g_unloading was set may
+    // still be running mod code. It bails out quickly, and doesn't wait for this
+    // thread, so this can't deadlock.
+    while (g_colorValuesChangedHandlersRunning > 0) {
+        Sleep(10);
+    }
 }
 
 void Wh_ModSettingsChanged() {
     Wh_Log(L">");
 
-    LoadSettings();
-
-    ApplySettings();
+    ApplySettings(/*reloadSettings=*/true);
 }
